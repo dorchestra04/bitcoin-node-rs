@@ -1,0 +1,9 @@
+[package]
+name = "p2p-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hickory-resolver = "0.24"
+
