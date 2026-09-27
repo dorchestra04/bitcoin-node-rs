@@ -51,6 +51,7 @@ struct Peers {
 }
 
 const PEERS_FILE: &str = "peers.json";
+const ANCHORS_FILE: &str = "anchors.json";
 
 impl Peers {
     pub fn new() -> Peers {
@@ -100,11 +101,24 @@ impl Peers {
         self.len += 1;
         self.peers.push(peer);
     }
-    
-    pub fn clean_peers(&mut self) {
-        self.peers.retain(|p| p.failed < 3);
-        self.len = self.peers.len()
+}
+
+fn load_anchors() -> Vec<SocketAddr> {
+    match File::open(ANCHORS_FILE) {
+        Ok(mut file) => {
+            let mut buffer = String::new();
+            if file.read_to_string(&mut buffer).is_err() || buffer.is_empty() {
+                return vec![];
+            }
+            serde_json::from_str(&buffer).unwrap_or_default()
+        }
+        Err(_e) => vec![],
     }
+}
+
+fn save_anchors(anchors: &Vec<SocketAddr>) {
+    let json = serde_json::to_string(anchors).unwrap();
+    fs::write(ANCHORS_FILE, json).unwrap();
 }
 // Network
 const MAINNET: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
@@ -121,15 +135,6 @@ struct HeaderMessage {
 }
 
 impl HeaderMessage {
-    pub fn new(magic: [u8; 4], command: [u8; 12]) -> HeaderMessage {
-        HeaderMessage {
-            magic,
-            command,
-            length: 0,
-            checksum: [0x00; 4]
-        }
-    }
-
     pub fn version() -> HeaderMessage {
         HeaderMessage {
             magic: MAINNET,
@@ -327,6 +332,24 @@ fn read_bool(buf: &mut &[u8]) -> Option<bool> {
     Some(bytes[0] != 0)
 }
 
+fn read_n(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match stream.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ))
+            }
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl Deserialize<VersionMessage> for VersionMessage {
     fn deserialize(payload: &mut &[u8]) -> Self {
         let version = read_u32(payload).unwrap();
@@ -379,7 +402,9 @@ async fn main() {
     let mut store: Peers = Peers::new();
     store.load();
 
-    if store.len == 0 {
+    let mut anchors: Vec<SocketAddr> = load_anchors();
+
+    if anchors.is_empty() {
         let mut ips_v4: Vec<Ipv4Addr> = vec![];
         let mut ips_v6: Vec<Ipv6Addr> = vec![];
 
@@ -428,6 +453,7 @@ async fn main() {
                     println!("Connected to {}", socket_address);
                     new_peer.responded();
                     store.add_peer(new_peer);
+                    anchors.push(socket_address);
                 }
                 Err(_e) => {
                     println!("Failed to connect to {}", socket_address);
@@ -448,6 +474,7 @@ async fn main() {
                     println!("Connected to {}", socket_address);
                     new_peer.responded();
                     store.add_peer(new_peer);
+                    anchors.push(socket_address);
                 }
                 Err(_e) => {
                     println!("Failed to connect to {}", socket_address);
@@ -457,24 +484,27 @@ async fn main() {
             }
         }
     } else {
-            println!("Retrieving peers...");
-            for peer in &mut store.peers{
-            let socket_address = peer.address;
+        println!("Retrieving anchors...");
+        let mut responding: Vec<SocketAddr> = vec![];
+        for anchor in anchors.iter() {
+            let socket_address = *anchor;
             let limit_time = Duration::from_secs(3);
-            
+
             match TcpStream::connect_timeout(&socket_address, limit_time) {
                 Ok(_stream) => {
-                    peer.responded();
+                    println!("Connected to {}", socket_address);
+                    responding.push(socket_address);
                 }
                 Err(_e) => {
-                    peer.failed();
+                    println!("Failed to connect to {}", socket_address);
                 }
             }
         }
-        store.clean_peers();
+        anchors = responding;
     };
 
     store.save();
+    save_anchors(&anchors);
     println!("\n--------------------------------------------------------------------------");
     println!("--- Result ---");
     println!("--------------------------------------------------------------------------\n");
@@ -492,4 +522,69 @@ async fn main() {
 
     let mut header_verack_message = HeaderMessage::verack();
     header_verack_message.compute_checksum(&"".as_bytes().to_vec());
+
+    let mut message: Vec<u8> = Vec::new();
+
+    message.extend(header_version_message.serialize());
+    message.extend(payload_version);
+
+    let peer = store.peers.get(1).unwrap();
+    
+    let mut stream = match TcpStream::connect(peer.address) {
+        Ok(stream) => {
+            println!("Connected to {}", peer.address);
+            stream
+        },
+        Err(e) => {
+            println!("Error connecting to {}: {}", peer.address, e);
+            return;
+        }
+    };
+
+    if let Err(e) = stream.write_all(&message) {
+        println!("Error sending version message: {}", e);
+        return;
+    };
+
+    println!("Sent version message to {}", peer.address);
+
+    loop {
+        let mut buffer = [0; 24];
+        if let Err(e) = read_n(&mut stream, &mut buffer) {
+            println!("Error reading message from {}: {}", peer.address, e);
+            return;
+        };
+
+        let header_message = HeaderMessage::deserialize(&mut &buffer[..]);
+
+        let mut payload = vec![0; header_message.length as usize];
+        if let Err(e) = read_n(&mut stream, &mut payload) {
+            println!("Error reading message payload from {}: {}", peer.address, e);
+            return;
+        };
+
+        match header_message.command {
+            VERSION => {
+                let version_message = VersionMessage::deserialize(&mut &payload[..]);
+
+                println!("User agent: {}", version_message.user_agent);
+                println!("Start height: {}", version_message.start_height);
+
+                if let Err(e) = stream.write_all(&header_verack_message.serialize()) {
+                    println!("Error sending verack message: {}", e);
+                    return;
+                }
+
+                println!("Sent verack message to {}", peer.address);
+            },
+            VERACK => {
+                println!("Received verack message from {}", peer.address);
+
+                break;
+            },
+            _ => {
+                println!("Received unknown message from {}", String::from_utf8_lossy(&header_message.command));
+            }
+        }
+    }
 }
