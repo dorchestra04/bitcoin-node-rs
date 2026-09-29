@@ -1,8 +1,11 @@
 use hickory_resolver::{TokioAsyncResolver, config::{ResolverConfig, ResolverOpts}};
-use std::{ io::{Read, Write}, println, vec};
+use std::{ io::Read, println, vec};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use serde::{ Serialize as SerdeSerialize, Deserialize as SerdeDeserialize};
 use sha2::{Sha256, Digest};
 
@@ -13,7 +16,15 @@ pub trait Serialize {
 }
 
 pub trait Deserialize<T> {
-    fn deserialize(payload: &mut &[u8]) -> T;
+    fn deserialize(payload: &mut &[u8]) -> Option<T>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, SerdeSerialize, SerdeDeserialize, Default)]
+enum Source {
+    #[default]
+    Seed,
+    Requested,
+    Announced,
 }
 
 #[derive(Debug, SerdeSerialize, SerdeDeserialize)]
@@ -22,6 +33,8 @@ struct Peer {
     attemts: u8,
     failed: u8,
     last_seen: u64,
+    #[serde(default)]
+    source: Source,
 }
 
 impl Peer {
@@ -31,6 +44,7 @@ impl Peer {
             attemts: 0,
             failed: 0,
             address: socket,
+            source: Source::Seed,
         }
     }
     fn responded(&mut self) {
@@ -70,7 +84,13 @@ impl Peers {
         }
 
         if !buffer.is_empty() {
-            return serde_json::from_str(&buffer).unwrap();
+            return match serde_json::from_str(&buffer) {
+                Ok(peers) => peers,
+                Err(e) => {
+                    println!("Error parsing {}: {}", PEERS_FILE, e);
+                    Peers { peers: vec![], len: 0 }
+                }
+            };
         }
 
         Peers {
@@ -81,12 +101,20 @@ impl Peers {
 
     pub fn load(&mut self) {
         let mut buffer = String::new();
-        if let Err(e) = File::open(PEERS_FILE).unwrap().read_to_string(&mut buffer) {
-            println!("Error reading file: {}", e);
+        match File::open(PEERS_FILE) {
+            Ok(mut file) => {
+                if let Err(e) = file.read_to_string(&mut buffer) {
+                    println!("Error reading file: {}", e);
+                }
+            }
+            Err(e) => println!("Error opening file: {}", e),
         };
 
         if !buffer.is_empty() {
-            *self = serde_json::from_str(&buffer).unwrap();
+            match serde_json::from_str(&buffer) {
+                Ok(peers) => *self = peers,
+                Err(e) => println!("Error parsing {}: {}", PEERS_FILE, e),
+            }
         }
     }
 
@@ -98,8 +126,25 @@ impl Peers {
 
 
     pub fn add_peer(&mut self, peer: Peer) {
+        if let Some(known) = self.peers.iter_mut().find(|known| known.address == peer.address) {
+            known.last_seen = peer.last_seen;
+            return;
+        }
         self.len += 1;
         self.peers.push(peer);
+    }
+
+    pub fn knows(&self, socket: &SocketAddr) -> bool {
+        self.peers.iter().any(|known| known.address == *socket)
+    }
+
+    pub fn relay_addrs(&self) -> Vec<SocketAddr> {
+        let limit = std::cmp::min(self.peers.len() * RELAY_PERCENT / 100, MAX_ADDR_ENTRIES);
+        self.peers.iter()
+            .filter(|peer| peer.attemts > 0)
+            .take(limit)
+            .map(|peer| peer.address)
+            .collect()
     }
 }
 
@@ -126,6 +171,22 @@ const MAINNET: [u8; 4] = [0xf9, 0xbe, 0xb4, 0xd9];
 // Commands
 const VERACK: [u8; 12] = [0x76, 0x65, 0x72, 0x61, 0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
 const VERSION: [u8; 12] = [0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x00, 0x00];
+const ADDOR: [u8; 12] = [0x61, 0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const GETADDR: [u8; 12] = [0x67, 0x65, 0x74, 0x61, 0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00];
+const PING: [u8; 12] = [0x70, 0x69, 0x6E, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+const PONG: [u8; 12] = [0x70, 0x6F, 0x6E, 0x67, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+
+// Wire
+const HEADER_SIZE: usize = 24;
+const ADDR_ENTRY_SIZE: usize = 30;
+const MAX_ADDR_ENTRIES: usize = 1000;
+const MAX_PAYLOAD_SIZE: usize = MAX_ADDR_ENTRIES * ADDR_ENTRY_SIZE + 9;
+const RELAY_PERCENT: usize = 23;
+const NODE_NETWORK_LIMITED: u64 = 1024;
+
+// Local node
+const LISTEN_PORT: u16 = 8333;
+const HANDSHAKE_TIMEOUT: u64 = 60;
 
 struct HeaderMessage {
     magic: [u8; 4],
@@ -135,25 +196,7 @@ struct HeaderMessage {
 }
 
 impl HeaderMessage {
-    pub fn version() -> HeaderMessage {
-        HeaderMessage {
-            magic: MAINNET,
-            command: VERSION,
-            length: 0,
-            checksum: [0x00; 4]
-        }
-    }
-
-    pub fn verack() -> HeaderMessage {
-        HeaderMessage {
-            magic: MAINNET,
-            command: VERACK,
-            length: 0,
-            checksum: [0x00; 4]
-        }
-    }
-
-    pub fn compute_checksum(&mut self, payload: &Vec<u8>) {
+    pub fn compute_checksum(&mut self, payload: &[u8]) {
         let mut checksum: [u8; 4] = [0x00; 4];
         let hash1 = Sha256::digest(payload);
         let hash2 = Sha256::digest(hash1);
@@ -177,18 +220,18 @@ impl Serialize for HeaderMessage {
 }
 
 impl Deserialize<HeaderMessage> for HeaderMessage {
-    fn deserialize(payload: &mut &[u8]) -> HeaderMessage {
-        let magic = read_bytes(payload, 4).unwrap().try_into().ok().unwrap();
-        let command = read_bytes(payload, 12).unwrap().try_into().ok().unwrap();
-        let length = read_u32(payload).unwrap();
-        let checksum = read_bytes(payload, 4).unwrap().try_into().ok().unwrap();
+    fn deserialize(payload: &mut &[u8]) -> Option<HeaderMessage> {
+        let magic = read_bytes(payload, 4)?.try_into().ok()?;
+        let command = read_bytes(payload, 12)?.try_into().ok()?;
+        let length = read_u32(payload)?;
+        let checksum = read_bytes(payload, 4)?.try_into().ok()?;
 
-        HeaderMessage {
+        Some(HeaderMessage {
             magic,
             command,
             length,
             checksum
-        }
+        })
     }
 }
 
@@ -214,7 +257,7 @@ impl VersionMessage {
     pub fn new() -> VersionMessage {
         VersionMessage {
             version: 70016,
-            services: 0,
+            services: NODE_NETWORK_LIMITED,
             timestamp: 0,
             receiver_services: 0,
             receiver_address: [0x00; 16],
@@ -252,7 +295,7 @@ impl Serialize for VersionMessage {
 }
 
 pub fn decode_compact_size(bytes: &mut &[u8]) -> Option<usize> {
-    let &first_byte = bytes.get(0)?;
+    let &first_byte = bytes.first()?;
     *bytes = &bytes[1..];
 
     match first_byte {
@@ -317,6 +360,11 @@ fn read_u16(buf: &mut &[u8]) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.try_into().ok()?))
 }
 
+fn read_u16_be(buf: &mut &[u8]) -> Option<u16> {
+    let bytes = read_bytes(buf, 2)?;
+    Some(u16::from_be_bytes(bytes.try_into().ok()?))
+}
+
 fn read_u32(buf: &mut &[u8]) -> Option<u32> {
     let bytes = read_bytes(buf, 4)?;
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
@@ -332,43 +380,141 @@ fn read_bool(buf: &mut &[u8]) -> Option<bool> {
     Some(bytes[0] != 0)
 }
 
-fn read_n(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match stream.read(&mut buf[offset..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ))
+struct Addr {
+    timestamp: u32,
+    services: u64,
+    address: [u8; 16],
+    port: u16,
+}
+
+impl Addr {
+    pub fn new(socket: SocketAddr, services: u64) -> Addr {
+        let mut address = [0x00; 16];
+        match socket.ip() {
+            IpAddr::V4(ip) => {
+                address[10] = 0xff;
+                address[11] = 0xff;
+                address[12..].copy_from_slice(&ip.octets());
             }
-            Ok(n) => offset += n,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
+            IpAddr::V6(ip) => address.copy_from_slice(&ip.octets()),
+        }
+
+        Addr {
+            timestamp: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32,
+            services,
+            address,
+            port: socket.port(),
         }
     }
-    Ok(())
+
+    pub fn socket(&self) -> Option<SocketAddr> {
+        if self.port == 0 {
+            return None;
+        }
+
+        let ip = Ipv6Addr::from(self.address);
+        if let Some(ipv4) = ip.to_ipv4_mapped() {
+            if ipv4.is_unspecified() {
+                return None;
+            }
+            return Some(SocketAddr::new(IpAddr::V4(ipv4), self.port));
+        }
+
+        if ip.is_unspecified() {
+            return None;
+        }
+
+        Some(SocketAddr::new(IpAddr::V6(ip), self.port))
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&self.timestamp.to_le_bytes());
+        buffer.extend_from_slice(&self.services.to_le_bytes());
+        buffer.extend_from_slice(&self.address);
+        buffer.extend_from_slice(&self.port.to_be_bytes());
+        buffer
+    }
+}
+
+fn serialize_addrs(addrs: &Vec<Addr>) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(&compact_size(addrs.len() as u64));
+    for addr in addrs {
+        buffer.extend_from_slice(&addr.serialize());
+    }
+    buffer
+}
+
+fn deserialize_addrs(payload: &mut &[u8]) -> Option<Vec<Addr>> {
+    let total = decode_compact_size(payload)?;
+
+    if total > MAX_ADDR_ENTRIES || payload.len() < total * ADDR_ENTRY_SIZE {
+        return None;
+    }
+
+    let mut addrs = Vec::new();
+    for _ in 0..total {
+        let timestamp = read_u32(payload)?;
+        let services = read_u64(payload)?;
+        let address = read_bytes(payload, 16)?.try_into().ok()?;
+        let port = read_u16_be(payload)?;
+        addrs.push(Addr { timestamp, services, address, port });
+    }
+
+    Some(addrs)
+}
+
+async fn send_message(stream: &mut tokio::net::TcpStream, command: [u8; 12], payload: &[u8]) -> std::io::Result<()> {
+    let mut header = HeaderMessage {
+        magic: MAINNET,
+        command,
+        length: payload.len() as u32,
+        checksum: [0x00; 4]
+    };
+    header.compute_checksum(payload);
+
+    stream.write_all(&header.serialize()).await?;
+    stream.write_all(payload).await
+}
+
+async fn read_message(stream: &mut tokio::net::TcpStream) -> Option<(HeaderMessage, Vec<u8>)> {
+    let mut buffer = [0; HEADER_SIZE];
+    stream.read_exact(&mut buffer).await.ok()?;
+
+    let header = HeaderMessage::deserialize(&mut &buffer[..])?;
+
+    if header.length as usize > MAX_PAYLOAD_SIZE {
+        return None;
+    }
+
+    let mut payload = vec![0; header.length as usize];
+    if header.length > 0 {
+        stream.read_exact(&mut payload).await.ok()?;
+    }
+
+    Some((header, payload))
 }
 
 impl Deserialize<VersionMessage> for VersionMessage {
-    fn deserialize(payload: &mut &[u8]) -> Self {
-        let version = read_u32(payload).unwrap();
-        let services = read_u64(payload).unwrap();
-        let timestamp = read_u64(payload).unwrap();
-        let receiver_services = read_u64(payload).unwrap();
-        let receiver_address = read_bytes(payload, 16).unwrap().try_into().ok().unwrap();
-        let receiver_port = read_u16(payload).unwrap();
-        let sender_services = read_u64(payload).unwrap();
-        let sender_address = read_bytes(payload, 16).unwrap().try_into().ok().unwrap();
-        let sender_port = read_u16(payload).unwrap();
-        let nonce = read_u64(payload).unwrap();
-        let ua_len = decode_compact_size(payload).unwrap();
-        let ua_bytes = read_bytes(payload, ua_len).unwrap();
+    fn deserialize(payload: &mut &[u8]) -> Option<Self> {
+        let version = read_u32(payload)?;
+        let services = read_u64(payload)?;
+        let timestamp = read_u64(payload)?;
+        let receiver_services = read_u64(payload)?;
+        let receiver_address = read_bytes(payload, 16)?.try_into().ok()?;
+        let receiver_port = read_u16(payload)?;
+        let sender_services = read_u64(payload)?;
+        let sender_address = read_bytes(payload, 16)?.try_into().ok()?;
+        let sender_port = read_u16(payload)?;
+        let nonce = read_u64(payload)?;
+        let ua_len = decode_compact_size(payload)?;
+        let ua_bytes = read_bytes(payload, ua_len)?;
         let user_agent = String::from_utf8_lossy(ua_bytes).into_owned();
-        let start_height = read_u32(payload).unwrap();
+        let start_height = read_u32(payload)?;
         let relay = read_bool(payload).unwrap_or(true);
 
-        VersionMessage {
+        Some(VersionMessage {
             version,
             services,
             timestamp,
@@ -382,6 +528,215 @@ impl Deserialize<VersionMessage> for VersionMessage {
             user_agent,
             start_height,
             relay,
+        })
+    }
+}
+
+async fn send_version(stream: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    let mut version = VersionMessage::new();
+    let payload = version.serialize();
+    send_message(stream, VERSION, &payload).await
+}
+
+fn our_addr(version: &VersionMessage, local: Option<SocketAddr>) -> Option<SocketAddr> {
+    if version.receiver_port == LISTEN_PORT {
+        let seen = Addr {
+            timestamp: 0,
+            services: NODE_NETWORK_LIMITED,
+            address: version.receiver_address,
+            port: version.receiver_port,
+        };
+
+        if let Some(socket) = seen.socket() {
+            return Some(socket);
+        }
+    }
+
+    local.filter(|socket| socket.port() == LISTEN_PORT && !socket.ip().is_unspecified())
+}
+
+async fn peer_connection(mut stream: tokio::net::TcpStream, remote: SocketAddr, store: Arc<Mutex<Peers>>, incoming: bool) {
+    if incoming {
+        println!("Incoming connection from {}", remote);
+    } else if let Err(e) = send_version(&mut stream).await {
+        println!("Error sending version message to {}: {}", remote, e);
+        return;
+    }
+
+    let mut ours: Option<SocketAddr> = None;
+
+    loop {
+        let (header, payload) = match tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), read_message(&mut stream)).await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                println!("Connection with {} closed", remote);
+                break;
+            }
+            Err(_) => {
+                println!("Handshake with {} timed out", remote);
+                break;
+            }
+        };
+
+        match header.command {
+            VERSION => {
+                let version = match VersionMessage::deserialize(&mut &payload[..]) {
+                    Some(version) => version,
+                    None => {
+                        println!("Invalid version message from {}", remote);
+                        break;
+                    }
+                };
+
+                println!("User agent: {}", version.user_agent);
+                println!("Start height: {}", version.start_height);
+
+                ours = our_addr(&version, stream.local_addr().ok());
+
+                if incoming && let Err(e) = send_version(&mut stream).await {
+                    println!("Error sending version message to {}: {}", remote, e);
+                    break;
+                }
+
+                if let Err(e) = send_message(&mut stream, VERACK, &[]).await {
+                    println!("Error sending verack message to {}: {}", remote, e);
+                    break;
+                }
+
+                println!("Sent verack message to {}", remote);
+            }
+            VERACK => {
+                println!("Received verack message from {}", remote);
+                break;
+            }
+            _ => println!("Received unknown message from {} during handshake", remote),
+        }
+    }
+
+    if incoming {
+        let mut peer = Peer::new(remote);
+        peer.responded();
+        peer.source = Source::Announced;
+        store.lock().unwrap().add_peer(peer);
+    }
+
+    if let Err(e) = send_message(&mut stream, GETADDR, &[]).await {
+        println!("Error sending getaddr message to {}: {}", remote, e);
+    }
+
+    if let Some(socket) = ours {
+        let addrs = vec![Addr::new(socket, NODE_NETWORK_LIMITED)];
+        if let Err(e) = send_message(&mut stream, ADDOR, &serialize_addrs(&addrs)).await {
+            println!("Error sending addr message to {}: {}", remote, e);
+        } else {
+            println!("Announced {} to {}", socket, remote);
+        }
+    }
+
+    let mut answered = false;
+    let mut expecting_addrs = true;
+
+    loop {
+        let (header, payload) = match read_message(&mut stream).await {
+            Some(message) => message,
+            None => {
+                println!("Connection with {} closed", remote);
+                break;
+            }
+        };
+
+        match header.command {
+            GETADDR => {
+                if !incoming {
+                    println!("Ignored getaddr message from {}", remote);
+                    continue;
+                }
+
+                if answered {
+                    continue;
+                }
+                answered = true;
+
+                let addrs: Vec<Addr> = store.lock().unwrap().relay_addrs()
+                    .iter()
+                    .map(|socket| Addr::new(*socket, NODE_NETWORK_LIMITED))
+                    .collect();
+
+                if let Err(e) = send_message(&mut stream, ADDOR, &serialize_addrs(&addrs)).await {
+                    println!("Error sending addr message to {}: {}", remote, e);
+                } else {
+                    println!("Sent {} addresses to {}", addrs.len(), remote);
+                }
+            }
+            ADDOR => {
+                let addrs = match deserialize_addrs(&mut &payload[..]) {
+                    Some(addrs) => addrs,
+                    None => {
+                        println!("Invalid addr message from {}", remote);
+                        break;
+                    }
+                };
+
+                let mut learned = 0;
+                let mut peers = store.lock().unwrap();
+                for addr in addrs {
+                    if let Some(socket) = addr.socket() {
+                        if Some(socket) == ours || peers.knows(&socket) {
+                            continue;
+                        }
+
+                        let mut peer = Peer::new(socket);
+                        if expecting_addrs {
+                            expecting_addrs = false;
+                            peer.source = Source::Requested;
+                        } else {
+                            peer.source = Source::Announced;
+                        }
+
+                        peers.add_peer(peer);
+                        learned += 1;
+                    }
+                }
+
+                println!("Learned {} addresses from {}", learned, remote);
+            },
+            PING => {
+                println!("Received ping from {}, responding with pong", remote);
+                if let Err(e) = send_message(&mut stream, PONG, &payload).await {
+    			    println!("Error sending pong message to {}: {}", remote, e);
+    			break;
+                }
+            }
+            _ => println!("Received unknown message from {} ({} bytes)", String::from_utf8_lossy(&header.command), payload.len()),
+        }
+    }
+
+    let mut peers = store.lock().unwrap();
+    peers.save();
+}
+
+async fn listen_connections(store: Arc<Mutex<Peers>>) {
+    let bind = SocketAddr::from(([0, 0, 0, 0], LISTEN_PORT));
+
+    let listener = match TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            println!("Error listening on {}: {}", bind, e);
+            return;
+        }
+    };
+
+    println!("Listening for incoming connections on {}", bind);
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, remote)) => {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    peer_connection(stream, remote, store, true).await;
+                });
+            }
+            Err(e) => println!("Error accepting connection: {}", e),
         }
     }
 }
@@ -512,79 +867,34 @@ async fn main() {
     println!("\n--------------------------- Peers statistics ---------------------------");
 
     for peer in &store.peers {
-        println!("peer statistic: {}, Attemts: {}, Failed: {}, Seen: {}", peer.address, peer.attemts, peer.failed, peer.last_seen);
+        println!("peer statistic: {}, Attemts: {}, Failed: {}, Seen: {}, Source: {:?}", peer.address, peer.attemts, peer.failed, peer.last_seen, peer.source);
     }
     println!("--------------------------------------------------------------------------");
 
-    let mut header_version_message = HeaderMessage::version();
-    let payload_version = VersionMessage::new().serialize();
-    header_version_message.compute_checksum(&payload_version);
+    let store = Arc::new(Mutex::new(store));
 
-    let mut header_verack_message = HeaderMessage::verack();
-    header_verack_message.compute_checksum(&"".as_bytes().to_vec());
+    tokio::spawn(listen_connections(store.clone()));
 
-    let mut message: Vec<u8> = Vec::new();
-
-    message.extend(header_version_message.serialize());
-    message.extend(payload_version);
-
-    let peer = store.peers.get(1).unwrap();
-    
-    let mut stream = match TcpStream::connect(peer.address) {
-        Ok(stream) => {
-            println!("Connected to {}", peer.address);
-            stream
-        },
-        Err(e) => {
-            println!("Error connecting to {}: {}", peer.address, e);
-            return;
-        }
+    let peer_address = {
+        let peers = store.lock().unwrap();
+        peers.peers.get(1).map(|peer| peer.address)
     };
 
-    if let Err(e) = stream.write_all(&message) {
-        println!("Error sending version message: {}", e);
-        return;
-    };
-
-    println!("Sent version message to {}", peer.address);
-
-    loop {
-        let mut buffer = [0; 24];
-        if let Err(e) = read_n(&mut stream, &mut buffer) {
-            println!("Error reading message from {}: {}", peer.address, e);
-            return;
-        };
-
-        let header_message = HeaderMessage::deserialize(&mut &buffer[..]);
-
-        let mut payload = vec![0; header_message.length as usize];
-        if let Err(e) = read_n(&mut stream, &mut payload) {
-            println!("Error reading message payload from {}: {}", peer.address, e);
-            return;
-        };
-
-        match header_message.command {
-            VERSION => {
-                let version_message = VersionMessage::deserialize(&mut &payload[..]);
-
-                println!("User agent: {}", version_message.user_agent);
-                println!("Start height: {}", version_message.start_height);
-
-                if let Err(e) = stream.write_all(&header_verack_message.serialize()) {
-                    println!("Error sending verack message: {}", e);
-                    return;
+    match peer_address {
+        Some(address) => {
+            let store = store.clone();
+            tokio::spawn(async move {
+                match tokio::net::TcpStream::connect(address).await {
+                    Ok(stream) => {
+                        println!("Connected to {}", address);
+                        peer_connection(stream, address, store, false).await;
+                    }
+                    Err(e) => println!("Error connecting to {}: {}", address, e),
                 }
-
-                println!("Sent verack message to {}", peer.address);
-            },
-            VERACK => {
-                println!("Received verack message from {}", peer.address);
-
-                break;
-            },
-            _ => {
-                println!("Received unknown message from {}", String::from_utf8_lossy(&header_message.command));
-            }
+            });
         }
+        None => println!("No peers available to connect"),
     }
+
+    std::future::pending::<()>().await;
 }
